@@ -1,2 +1,187 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+#include "esp_camera.h"
+#include <WiFi.h>
+#include "esp_http_server.h"
+#include "FS.h"
+#include "SD_MMC.h"
+
+// 🔐 WiFi
+const char* ssid = "kavi";
+const char* password = "10101010";
+
+// 🔘 Button pin
+#define BUTTON_PIN 13
+
+// Camera pins (AI Thinker)
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+int frameCount = 0;
+bool record = false;
+
+// 📸 Capture via browser
+esp_err_t capture_handler(httpd_req_t *req) {
+  camera_fb_t * fb = esp_camera_fb_get();
+  if (!fb) return ESP_FAIL;
+
+  httpd_resp_set_type(req, "image/jpeg");
+  httpd_resp_send(req, (const char *)fb->buf, fb->len);
+
+  esp_camera_fb_return(fb);
+  return ESP_OK;
+}
+
+// 🎥 Stream
+esp_err_t stream_handler(httpd_req_t *req) {
+  camera_fb_t * fb = NULL;
+  char buf[64];
+
+  httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=frame");
+
+  while (true) {
+    fb = esp_camera_fb_get();
+    if (!fb) continue;
+
+    int len = snprintf(buf, sizeof(buf),
+      "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
+      fb->len);
+
+    httpd_resp_send_chunk(req, buf, len);
+    httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
+    httpd_resp_send_chunk(req, "\r\n", 2);
+
+    // 💾 Save frames if recording ON
+    if (record) {
+      String path = "/frame_" + String(frameCount++) + ".jpg";
+      File file = SD_MMC.open(path.c_str(), FILE_WRITE);
+      if (file) {
+        file.write(fb->buf, fb->len);
+        file.close();
+      }
+    }
+
+    esp_camera_fb_return(fb);
+  }
+}
+
+// ▶️ Start recording (browser)
+esp_err_t start_record(httpd_req_t *req) {
+  record = true;
+  httpd_resp_sendstr(req, "Recording Started");
+  return ESP_OK;
+}
+
+// ⏹ Stop recording (browser)
+esp_err_t stop_record(httpd_req_t *req) {
+  record = false;
+  httpd_resp_sendstr(req, "Recording Stopped");
+  return ESP_OK;
+}
+
+void startServer() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  httpd_handle_t server = NULL;
+  httpd_start(&server, &config);
+
+  httpd_uri_t capture_uri = {"/capture", HTTP_GET, capture_handler};
+  httpd_uri_t stream_uri = {"/stream", HTTP_GET, stream_handler};
+  httpd_uri_t start_uri = {"/start", HTTP_GET, start_record};
+  httpd_uri_t stop_uri = {"/stop", HTTP_GET, stop_record};
+
+  httpd_register_uri_handler(server, &capture_uri);
+  httpd_register_uri_handler(server, &stream_uri);
+  httpd_register_uri_handler(server, &start_uri);
+  httpd_register_uri_handler(server, &stop_uri);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size = FRAMESIZE_QVGA;
+  config.jpeg_quality = 12;
+  config.fb_count = 1;
+
+  if (esp_camera_init(&config) != ESP_OK) {
+    Serial.println("Camera Failed");
+    return;
+  }
+
+  if (!SD_MMC.begin()) {
+    Serial.println("SD Card Failed");
+  }
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi Connected");
+  Serial.print("Open: http://");
+  Serial.println(WiFi.localIP());
+
+  startServer();
+}
+
+void loop() {
+  // 🔘 Button control
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    Serial.println("Button Pressed");
+
+    // 📸 Capture photo
+    camera_fb_t * fb = esp_camera_fb_get();
+    if (fb) {
+      File file = SD_MMC.open("/button_photo.jpg", FILE_WRITE);
+      if (file) {
+        file.write(fb->buf, fb->len);
+        file.close();
+        Serial.println("Photo Saved");
+      }
+      esp_camera_fb_return(fb);
+    }
+
+    // 🎥 Toggle recording
+    record = !record;
+    Serial.println(record ? "Recording ON" : "Recording OFF");
+
+    delay(1000); // debounce
+  }
+}
